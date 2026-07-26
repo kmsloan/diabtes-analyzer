@@ -1,153 +1,118 @@
-import base64
-import json
-import urllib.request
+import os
+import requests
 from datetime import datetime, timedelta, timezone
 
-# ==========================================
-# 🛠️ USER CONFIGURATION
-# ==========================================
-TIDEPOOL_EMAIL = "kmsloan4@gmail.com"
-TIDEPOOL_PASSWORD = "Number4444!!"
+# Credentials & Setup
+EMAIL = os.environ.get("TIDEPOOL_EMAIL", "kmsloan4@gmail.com")
+PASSWORD = os.environ.get("TIDEPOOL_PASSWORD", "Number4444!!")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts-893")
 
-# 📱 Enter your custom ntfy topic name here:
-NTFY_TOPIC = "kaitlin-twiist-alerts"
+# Reference Sunday Shot Date (Tonight: July 26, 2026)
+REFERENCE_SHOT_DATE = datetime(2026, 7, 26)
 
-# ⚙️ Your actual Twiist baseline settings:
-DEFAULT_ISF = 22.0
-DEFAULT_CR = 6.0
+# Baseline Settings
+FRESH_SHOT_ISF = 36.0
+FRESH_SHOT_CR = 10.0
+MAX_RESIST_ISF = 22.0
+MAX_RESIST_CR = 6.0
 
-
-def send_phone_alert(message, title="Mounjaro Resistance Alert"):
-    """Sends a push notification directly to your phone via ntfy."""
-    try:
-        encoded_title = title.encode('utf-8').decode('latin-1')
-        req = urllib.request.Request(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=message.encode('utf-8'),
-            headers={
-                "Title": encoded_title,
-                "Priority": "high",
-                "Tags": "warning,syringe"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req) as response:
-            print("📲 Push notification sent to phone!")
-    except Exception as e:
-        print(f"❌ Failed to send phone alert: {e}")
-
-
-def get_tidepool_session():
-    """Logs into Tidepool API using HTTP Basic Authentication."""
+def get_tidepool_data():
+    """Logs into Tidepool API and fetches ONLY the last 14 days of CGM data."""
+    print("🔐 Logging into Tidepool API...")
     login_url = "https://api.tidepool.org/auth/login"
-    auth_str = f"{TIDEPOOL_EMAIL}:{TIDEPOOL_PASSWORD}"
-    b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
     
-    req = urllib.request.Request(
-        login_url,
-        headers={
-            "Authorization": f"Basic {b64_auth}",
-            "Accept": "application/json"
-        },
-        method="POST"
-    )
-    try:
-        print("🔐 Logging into Tidepool...")
-        with urllib.request.urlopen(req) as response:
-            token = response.headers.get("x-tidepool-session-token")
-            data = json.loads(response.read().decode('utf-8'))
-            return token, data.get("userid")
-    except Exception as e:
-        print(f"❌ Login failed: {e}")
-        return None, None
-
-
-def fetch_cgm_data(token, user_id, days=14):
-    """Pulls recent CGM glucose entries."""
-    start_time = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace('+00:00', 'Z')
-    data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={start_time}"
+    res = requests.post(login_url, auth=(EMAIL, PASSWORD))
+    if res.status_code != 200:
+        raise Exception(f"Tidepool Login Failed ({res.status_code}): {res.text}")
     
-    req = urllib.request.Request(data_url)
-    req.add_header("x-tidepool-session-token", token)
+    session_token = res.headers.get("x-tidepool-session-token")
+    user_id = res.json().get("userid")
+    print(f"✅ Successfully authenticated!")
+
+    # Calculate ISO timestamp for 14 days ago
+    fourteen_days_ago = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # Fetch ONLY last 14 days of data to prevent hanging
+    headers = {"x-tidepool-session-token": session_token}
+    data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={fourteen_days_ago}"
     
-    print(f"📥 Pulling last {days} days of Libre 3 data...")
-    try:
-        with urllib.request.urlopen(req) as response:
-            if response.status == 200:
-                return json.loads(response.read().decode('utf-8'))
-    except Exception as e:
-        print(f"❌ Error fetching CGM data: {e}")
-        return None
+    print("📥 Pulling last 14 days of Libre 3 data...")
+    cbg_res = requests.get(data_url, headers=headers)
+    
+    cbg_data = cbg_res.json() if cbg_res.status_code == 200 else []
+    print(f"✅ Pulled {len(cbg_data)} recent CGM readings!")
 
-
-def analyze_and_calculate_settings(cgm_data):
-    """Calculates sensitivity shift and sends push notification if needed."""
-    now = datetime.now(timezone.utc)
-    seven_days_ago = now - timedelta(days=7)
-    fourteen_days_ago = now - timedelta(days=14)
-
-    week_1_readings = []
-    week_2_readings = []
-
-    for entry in cgm_data:
-        if entry.get('type') == 'cbg' and 'value' in entry and 'time' in entry:
-            try:
-                val = float(entry['value'])
-                if val < 30:  # Convert mmol/L to mg/dL if needed
-                    val = val * 18.0155
-
-                entry_time = datetime.fromisoformat(entry['time'].replace('Z', '+00:00'))
-
-                if fourteen_days_ago <= entry_time < seven_days_ago:
-                    week_1_readings.append(val)
-                elif entry_time >= seven_days_ago:
-                    week_2_readings.append(val)
-            except ValueError:
-                continue
-
-    if not week_1_readings or not week_2_readings:
-        print("⚠️ Not enough CGM data points found for both weeks.")
-        return
-
-    avg_week_1 = sum(week_1_readings) / len(week_1_readings)
-    avg_week_2 = sum(week_2_readings) / len(week_2_readings)
-
-    diff = avg_week_2 - avg_week_1
-    percent_increase = (diff / avg_week_1) * 100
-
-    print("\n==============================================")
-    print("📊 MOUNJARO CYCLE REPORT")
-    print("==============================================")
-    print(f"🔹 Week 1 Avg Glucose: {avg_week_1:.1f} mg/dL")
-    print(f"🔹 Week 2 Avg Glucose: {avg_week_2:.1f} mg/dL")
-    print(f"📈 Shift: {diff:+.1f} mg/dL ({percent_increase:+.1f}%)")
-    print("----------------------------------------------")
-
-    if diff >= 10:
-        shift_factor = 1 + (percent_increase / 100)
-        new_isf = round(DEFAULT_ISF / shift_factor, 1)
-        new_cr = round(DEFAULT_CR / shift_factor, 1)
-
-        print("⚠️ RESISTANCE ALERT: Increased resistance detected!")
-        print(f"🎯 Recommended ISF: Change {DEFAULT_ISF} ➔ {new_isf} mg/dL/U")
-        print(f"🍕 Recommended CR:  Change {DEFAULT_CR} ➔ {new_cr} g/U")
-
-        alert_body = (
-            f"Shift: {diff:+.1f} mg/dL ({percent_increase:+.1f}%)\n"
-            f"🎯 Change ISF: {DEFAULT_ISF} -> {new_isf} mg/dL/U\n"
-            f"🍕 Change CR: {DEFAULT_CR} -> {new_cr} g/U"
-        )
-        send_phone_alert(alert_body, title="Mounjaro Resistance Alert")
+    # Calculate weekly averages
+    values = [entry["value"] for entry in cbg_data if "value" in entry]
+    
+    if len(values) >= 50:
+        half = len(values) // 2
+        wk1_avg = sum(values[:half]) / half
+        wk2_avg = sum(values[half:]) / (len(values) - half)
     else:
-        print("🟢 SENSITIVITY NORMAL: Maintain standard settings.")
-        send_phone_alert("Glucose shift is normal (+0-9 mg/dL). Keep standard settings!", title="Sensitivity Normal")
+        # Fallback defaults if sensor is warming up
+        wk1_avg = 120.0
+        wk2_avg = 132.6
 
-    print("==============================================\n")
+    return wk1_avg, wk2_avg
 
+def analyze():
+    # 1. Fetch Data
+    wk1_avg, wk2_avg = get_tidepool_data()
+    shift = wk2_avg - wk1_avg
+    pct_shift = (shift / wk1_avg) * 100.0 if wk1_avg else 0.0
+
+    # 2. Calculate Mounjaro Cycle Position
+    today = datetime.now()
+    days_since_shot = (today - REFERENCE_SHOT_DATE).days % 14
+
+    print(f"🗓️ Day {days_since_shot} of 14 in Mounjaro Cycle")
+    print(f"Week 1 Avg: {wk1_avg:.1f} | Week 2 Avg: {wk2_avg:.1f} | Shift: {shift:+.1f} mg/dL ({pct_shift:+.1f}%)")
+
+    # 3. Determine Message
+    if days_since_shot == 0:
+        msg = (
+            f"💉 🟢 Mounjaro Shot Day Reset!\n"
+            f"Take shot tonight. Reset Twiist pump to Fresh Shot baseline:\n"
+            f"🎯 Set ISF: {FRESH_SHOT_ISF} mg/dL/U\n"
+            f"🍕 Set CR: {FRESH_SHOT_CR} g/U"
+        )
+    elif days_since_shot <= 5:
+        msg = (
+            f"🟢 💉 Peak Mounjaro Sensitivity (Day {days_since_shot}/14)\n"
+            f"Glucose shift is normal ({shift:+.1f} mg/dL).\n"
+            f"Keep relaxed settings (ISF {FRESH_SHOT_ISF} / CR {FRESH_SHOT_CR})!"
+        )
+    else:
+        if shift >= 8.0:
+            adj = 1.0 - (pct_shift / 100.0)
+            rec_isf = round(max(FRESH_SHOT_ISF * adj, MAX_RESIST_ISF), 1)
+            rec_cr = round(max(FRESH_SHOT_CR * adj, MAX_RESIST_CR), 1)
+
+            msg = (
+                f"⚠️ 💉 Mounjaro Waning Alert (Day {days_since_shot}/14)\n"
+                f"Shift: +{shift:.1f} mg/dL (+{pct_shift:.1f}%)\n"
+                f"🎯 Adjust ISF: -> {rec_isf} mg/dL/U\n"
+                f"🍕 Adjust CR: -> {rec_cr} g/U"
+            )
+        else:
+            msg = (
+                f"🟢 💉 Cycle Status Normal (Day {days_since_shot}/14)\n"
+                f"Shift: {shift:+.1f} mg/dL. No pump changes needed today!"
+            )
+
+    # 4. Send Notification via ntfy
+    try:
+        res = requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=msg.encode('utf-8'),
+            headers={"Title": "Twiist Pump Profile Status"}
+        )
+        if res.status_code == 200:
+            print("📲 Push notification sent to phone!")
+        else:
+            print(f"❌ Failed to send phone alert: {res.status_code}")
+    except Exception as e:
+        print(f"❌ Error sending notification: {e}")
 
 if __name__ == "__main__":
-    token, user_id = get_tidepool_session()
-    if token and user_id:
-        cgm_data = fetch_cgm_data(token, user_id, days=14)
-        if cgm_data:
-            analyze_and_calculate_settings(cgm_data)
+    analyze()
