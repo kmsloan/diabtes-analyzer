@@ -1,0 +1,26 @@
+name: Daily Mounjaro Cycle Check
+
+on:
+  schedule:
+    # Runs automatically every day at 8:00 AM CST (13:00 UTC)
+    - cron: '0 13 * * *'
+  workflow_dispatch: # Allows manual trigger anytime from GitHub
+
+jobs:
+  run-analyzer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Cycle Analyzer
+        env:
+          TIDEPOOL_EMAIL: ${{ secrets.TIDEPOOL_EMAIL }}
+          TIDEPOOL_PASSWORD: ${{ secrets.TIDEPOOL_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python analyzer.py
