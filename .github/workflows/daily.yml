@@ -3,7 +3,7 @@ name: Daily Mounjaro Cycle Check
 on:
   schedule:
     # Runs automatically every day at 8:00 AM CST (13:00 UTC)
-    - cron: '0 13 * * *'
+    - cron: '30 11 * * *'
   workflow_dispatch: # Allows manual trigger anytime from GitHub
 
 jobs:
