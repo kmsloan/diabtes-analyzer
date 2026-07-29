@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 # Credentials & Setup
 EMAIL = os.environ.get("TIDEPOOL_EMAIL", "kmsloan4@gmail.com")
 PASSWORD = os.environ.get("TIDEPOOL_PASSWORD", "Number4444!!")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts-893")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 
 # Reference Sunday Shot Date (Tonight: July 26, 2026)
 REFERENCE_SHOT_DATE = datetime(2026, 7, 26)
