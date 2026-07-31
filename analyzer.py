@@ -7,17 +7,17 @@ EMAIL = os.environ.get("TIDEPOOL_EMAIL", "kmsloan4@gmail.com")
 PASSWORD = os.environ.get("TIDEPOOL_PASSWORD", "Number4444!!")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 
-# Reference Sunday Shot Date (Tonight: July 26, 2026)
+# Reference Sunday Shot Date (July 26, 2026)
 REFERENCE_SHOT_DATE = datetime(2026, 7, 26)
 
-# Baseline Settings
+# Settings Range
 FRESH_SHOT_ISF = 36.0
 FRESH_SHOT_CR = 10.0
 MAX_RESIST_ISF = 22.0
 MAX_RESIST_CR = 6.0
 
 def get_tidepool_data():
-    """Logs into Tidepool API and fetches ONLY the last 14 days of CGM data."""
+    """Logs into Tidepool API and fetches last 14 days of CGM data."""
     print("🔐 Logging into Tidepool API...")
     login_url = "https://api.tidepool.org/auth/login"
     
@@ -27,48 +27,47 @@ def get_tidepool_data():
     
     session_token = res.headers.get("x-tidepool-session-token")
     user_id = res.json().get("userid")
-    print(f"✅ Successfully authenticated!")
+    print("✅ Successfully authenticated!")
 
-    # Calculate ISO timestamp for 14 days ago
     fourteen_days_ago = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    # Fetch ONLY last 14 days of data to prevent hanging
     headers = {"x-tidepool-session-token": session_token}
     data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={fourteen_days_ago}"
     
     print("📥 Pulling last 14 days of Libre 3 data...")
     cbg_res = requests.get(data_url, headers=headers)
-    
     cbg_data = cbg_res.json() if cbg_res.status_code == 200 else []
     print(f"✅ Pulled {len(cbg_data)} recent CGM readings!")
 
-    # Calculate weekly averages
-    values = [entry["value"] for entry in cbg_data if "value" in entry]
+    # Sort readings CHRONOLOGICALLY (Oldest to Newest)
+    valid_entries = [e for e in cbg_data if "value" in e and "time" in e]
+    valid_entries.sort(key=lambda x: x["time"])
+    
+    values = [entry["value"] for entry in valid_entries]
     
     if len(values) >= 50:
         half = len(values) // 2
-        wk1_avg = sum(values[:half]) / half
-        wk2_avg = sum(values[half:]) / (len(values) - half)
+        past_avg = sum(values[:half]) / half       # Older 7 days
+        recent_avg = sum(values[half:]) / (len(values) - half) # Most recent 7 days
     else:
-        # Fallback defaults if sensor is warming up
-        wk1_avg = 120.0
-        wk2_avg = 132.6
+        past_avg = 120.0
+        recent_avg = 132.6
 
-    return wk1_avg, wk2_avg
+    return past_avg, recent_avg
 
 def analyze():
     # 1. Fetch Data
-    wk1_avg, wk2_avg = get_tidepool_data()
-    shift = wk2_avg - wk1_avg
-    pct_shift = (shift / wk1_avg) * 100.0 if wk1_avg else 0.0
+    past_avg, recent_avg = get_tidepool_data()
+    shift = recent_avg - past_avg  # Corrected: Recent minus Past
+    pct_shift = (shift / past_avg) * 100.0 if past_avg else 0.0
 
     # 2. Calculate Mounjaro Cycle Position
     today = datetime.now()
     days_since_shot = (today - REFERENCE_SHOT_DATE).days % 14
 
     print(f"🗓️ Day {days_since_shot} of 14 in Mounjaro Cycle")
-    print(f"Week 1 Avg: {wk1_avg:.1f} | Week 2 Avg: {wk2_avg:.1f} | Shift: {shift:+.1f} mg/dL ({pct_shift:+.1f}%)")
+    print(f"Past Avg: {past_avg:.1f} | Recent Avg: {recent_avg:.1f} | Shift: {shift:+.1f} mg/dL ({pct_shift:+.1f}%)")
 
-    # 3. Determine Message
+    # 3. Dynamic Threshold Logic (Triggers even during Days 1-5 if glucose rises)
     if days_since_shot == 0:
         msg = (
             f"💉 🟢 Mounjaro Shot Day Reset!\n"
@@ -76,29 +75,23 @@ def analyze():
             f"🎯 Set ISF: {FRESH_SHOT_ISF} mg/dL/U\n"
             f"🍕 Set CR: {FRESH_SHOT_CR} g/U"
         )
-    elif days_since_shot <= 5:
+    elif shift >= 8.0:
+        # Dynamic adjustment scaled by percent shift
+        adj = min(max(pct_shift / 20.0, 0.1), 1.0)
+        rec_isf = round(max(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * adj, MAX_RESIST_ISF), 1)
+        rec_cr = round(max(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * adj, MAX_RESIST_CR), 1)
+
         msg = (
-            f"🟢 💉 Peak Mounjaro Sensitivity (Day {days_since_shot}/14)\n"
-            f"Glucose shift is normal ({shift:+.1f} mg/dL).\n"
-            f"Keep relaxed settings (ISF {FRESH_SHOT_ISF} / CR {FRESH_SHOT_CR})!"
+            f"⚠️ 💉 Mounjaro Waning/Resistance Alert (Day {days_since_shot}/14)\n"
+            f"Glucose Shift: +{shift:.1f} mg/dL (+{pct_shift:.1f}%)\n"
+            f"🎯 Recommended ISF: -> {rec_isf} mg/dL/U\n"
+            f"🍕 Recommended CR: -> {rec_cr} g/U"
         )
     else:
-        if shift >= 8.0:
-            adj = 1.0 - (pct_shift / 100.0)
-            rec_isf = round(max(FRESH_SHOT_ISF * adj, MAX_RESIST_ISF), 1)
-            rec_cr = round(max(FRESH_SHOT_CR * adj, MAX_RESIST_CR), 1)
-
-            msg = (
-                f"⚠️ 💉 Mounjaro Waning Alert (Day {days_since_shot}/14)\n"
-                f"Shift: +{shift:.1f} mg/dL (+{pct_shift:.1f}%)\n"
-                f"🎯 Adjust ISF: -> {rec_isf} mg/dL/U\n"
-                f"🍕 Adjust CR: -> {rec_cr} g/U"
-            )
-        else:
-            msg = (
-                f"🟢 💉 Cycle Status Normal (Day {days_since_shot}/14)\n"
-                f"Shift: {shift:+.1f} mg/dL. No pump changes needed today!"
-            )
+        msg = (
+            f"🟢 💉 Cycle Status Normal (Day {days_since_shot}/14)\n"
+            f"Shift: {shift:+.1f} mg/dL. Keep current settings (ISF {FRESH_SHOT_ISF} / CR {FRESH_SHOT_CR})!"
+        )
 
     # 4. Send Notification via ntfy
     try:
