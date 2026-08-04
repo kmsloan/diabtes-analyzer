@@ -10,15 +10,15 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 # Reference Sunday Shot Date (Sunday July 26, 2026)
 REFERENCE_SHOT_DATE = datetime(2026, 7, 26)
 
-# Settings Range
-FRESH_SHOT_ISF = 36.0   # Max sensitivity (Relaxed profile)
+# Baseline Settings Range
+FRESH_SHOT_ISF = 36.0   # Day 0-3 Peak Sensitivity
 FRESH_SHOT_CR = 10.0
 
-MAX_RESIST_ISF = 22.0   # Max resistance (Tight profile)
+MAX_RESIST_ISF = 22.0   # Day 12-13 Max Resistance
 MAX_RESIST_CR = 6.0
 
-# Day 2 Peak Sensitivity Benchmark (mg/dL)
-PEAK_BENCHMARK_MGDL = 117.5
+# Target Average Glucose Benchmark
+TARGET_MGDL = 117.5
 
 def get_tidepool_data():
     """Logs into Tidepool API and fetches last 14 days of CGM data in mg/dL."""
@@ -60,42 +60,51 @@ def get_tidepool_data():
     if recent_readings:
         recent_avg = sum(recent_readings) / len(recent_readings)
     else:
-        recent_avg = 117.5
+        recent_avg = TARGET_MGDL
 
-    return PEAK_BENCHMARK_MGDL, recent_avg
+    return TARGET_MGDL, recent_avg
 
 def analyze():
     # 1. Fetch Data
-    past_avg, recent_avg = get_tidepool_data()
-    shift = recent_avg - past_avg
-    pct_shift = (shift / past_avg) * 100.0 if past_avg else 0.0
-
-    # 2. Calculate Mounjaro Cycle Position
+    target_bg, recent_avg = get_tidepool_data()
+    
+    # 2. Calculate Mounjaro Cycle Position (0 to 13)
     today = datetime.now()
     days_since_shot = (today - REFERENCE_SHOT_DATE).days % 14
 
-    # Smooth 2-way scaling factor (0.0 = ISF 36/CR 10; 1.0 = ISF 22/CR 6)
-    adj = min(max(shift / 20.0, 0.0), 1.0)
+    # 3. Calculate Cycle-Aware Baseline Resistance (0.0 to 1.0)
+    # Days 0-3 = 0.0 (Fresh shot); Days 4-12 ramp smoothly to 1.0 (Max resistance)
+    if days_since_shot <= 3:
+        cycle_base_adj = 0.0
+    else:
+        cycle_base_adj = min((days_since_shot - 3) / 9.0, 1.0)
+
+    # 4. Apply 24h Glucose Modifier (+/- adjustment)
+    drift = recent_avg - target_bg
+    drift_adj = drift / 25.0  # +10 mg/dL drift adds +0.40 resistance modifier
     
-    rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * adj))
-    rec_cr = round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * adj, 1)
+    # Combined adjustment clamped between 0.0 and 1.0
+    final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
+
+    rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
+    rec_cr = round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj, 1)
 
     print(f"🗓️ Day {days_since_shot} of 14 in Mounjaro Cycle")
-    print(f"Peak Benchmark: {past_avg:.1f} mg/dL | Last 24h Avg: {recent_avg:.1f} mg/dL | Shift: {shift:+.1f} mg/dL ({pct_shift:+.1f}%)")
+    print(f"24h Avg: {recent_avg:.1f} mg/dL | Drift: {drift:+.1f} mg/dL | Cycle Base: {cycle_base_adj:.2f}")
 
-    # 3. Notification Message Logic
+    # 5. Build Message
     if days_since_shot == 0:
         header = "💉 🟢 Mounjaro Shot Day Reset!"
         action = "Take shot tonight. Set Twiist pump to Fresh Shot baseline:"
-    elif shift >= 6.0:
-        header = f"⚠️ 💉 Waning Resistance (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) is +{shift:.1f} mg/dL above peak. Tighten settings:"
-    elif shift <= -6.0:
-        header = f"🟢 💉 Relaxing Settings (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) dropped. Relax settings back UP to prevent lows:"
+    elif drift > 10.0:
+        header = f"⚠️ 💉 High Glucose Drift Alert (Day {days_since_shot}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) is elevated. Tightening settings beyond Day {days_since_shot} baseline:"
+    elif drift < -10.0:
+        header = f"🟢 💉 Low Glucose Relaxation Alert (Day {days_since_shot}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) is low. Relaxing settings below Day {days_since_shot} baseline:"
     else:
-        header = f"🟢 💉 Stable Profile (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) is on target. Maintain profile:"
+        header = f"🟢 💉 On Track Cycle Profile (Day {days_since_shot}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) is stable. Target Day {days_since_shot} profile:"
 
     msg = (
         f"{header}\n"
@@ -104,7 +113,7 @@ def analyze():
         f"🍕 Set CR: {rec_cr} g/U"
     )
 
-    # 4. Send Notification via ntfy
+    # 6. Send Push Notification
     try:
         res = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
