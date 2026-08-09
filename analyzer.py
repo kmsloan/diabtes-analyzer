@@ -7,14 +7,17 @@ EMAIL = os.environ.get("TIDEPOOL_EMAIL", "kmsloan4@gmail.com")
 PASSWORD = os.environ.get("TIDEPOOL_PASSWORD", "Number4444!!")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 
-# Reference Sunday Shot Date (Sunday July 26, 2026)
-REFERENCE_SHOT_DATE = datetime(2026, 7, 26)
+# Last Shot Date (Sunday July 26, 2026)
+LAST_SHOT_DATE = datetime(2026, 7, 26)
+
+# Mode Toggle: Set to False while paused/waiting for refill
+ON_MOUNJARO_SCHEDULE = False  
 
 # Baseline Settings Range
-FRESH_SHOT_ISF = 36.0   # Day 0-3 Peak Sensitivity
+FRESH_SHOT_ISF = 36.0   # Fresh shot sensitivity
 FRESH_SHOT_CR = 10.0
 
-MAX_RESIST_ISF = 22.0   # Day 12-13 Max Resistance
+MAX_RESIST_ISF = 22.0   # Off-shot / Max resistance
 MAX_RESIST_CR = 6.0
 
 # Target Average Glucose Benchmark
@@ -68,43 +71,44 @@ def analyze():
     # 1. Fetch Data
     target_bg, recent_avg = get_tidepool_data()
     
-    # 2. Calculate Mounjaro Cycle Position (0 to 13)
+    # 2. Calculate Days Since Last Shot
     today = datetime.now()
-    days_since_shot = (today - REFERENCE_SHOT_DATE).days % 14
+    days_since_shot = (today - LAST_SHOT_DATE).days
 
-    # 3. Calculate Cycle-Aware Baseline Resistance (0.0 to 1.0)
-    # Days 0-3 = 0.0 (Fresh shot); Days 4-12 ramp smoothly to 1.0 (Max resistance)
-    if days_since_shot <= 3:
-        cycle_base_adj = 0.0
+    # 3. Calculate Baseline Resistance
+    if ON_MOUNJARO_SCHEDULE:
+        # Standard 14-day cycle ramp
+        cycle_day = days_since_shot % 14
+        if cycle_day <= 3:
+            cycle_base_adj = 0.0
+        else:
+            cycle_base_adj = min((cycle_day - 3) / 9.0, 1.0)
     else:
-        cycle_base_adj = min((days_since_shot - 3) / 9.0, 1.0)
+        # OFF-SHOT MODE: Lock baseline to max resistance (1.0)
+        cycle_base_adj = 1.0
 
     # 4. Apply 24h Glucose Modifier (+/- adjustment)
     drift = recent_avg - target_bg
-    drift_adj = drift / 25.0  # +10 mg/dL drift adds +0.40 resistance modifier
+    drift_adj = drift / 25.0
     
-    # Combined adjustment clamped between 0.0 and 1.0
     final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
 
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
     rec_cr = round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj, 1)
 
-    print(f"🗓️ Day {days_since_shot} of 14 in Mounjaro Cycle")
-    print(f"24h Avg: {recent_avg:.1f} mg/dL | Drift: {drift:+.1f} mg/dL | Cycle Base: {cycle_base_adj:.2f}")
+    print(f"🗓️ Day {days_since_shot} Since Last Mounjaro Shot (Off-Shot Mode)")
+    print(f"24h Avg: {recent_avg:.1f} mg/dL | Drift: {drift:+.1f} mg/dL | Resistance Adj: {final_adj:.2f}")
 
     # 5. Build Message
-    if days_since_shot == 0:
-        header = "💉 🟢 Mounjaro Shot Day Reset!"
-        action = "Take shot tonight. Set Twiist pump to Fresh Shot baseline:"
-    elif drift > 10.0:
-        header = f"⚠️ 💉 High Glucose Drift Alert (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) is elevated. Tightening settings beyond Day {days_since_shot} baseline:"
-    elif drift < -10.0:
-        header = f"🟢 💉 Low Glucose Relaxation Alert (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) is low. Relaxing settings below Day {days_since_shot} baseline:"
+    if not ON_MOUNJARO_SCHEDULE:
+        header = f"⚠️ 💉 Mounjaro Off-Shot Pause (Day {days_since_shot})"
+        if drift > 10.0:
+            action = f"24h Avg ({recent_avg:.1f} mg/dL) elevated without Mounjaro. Max resistance active:"
+        else:
+            action = f"24h Avg ({recent_avg:.1f} mg/dL) holding. Recommended off-shot profile:"
     else:
         header = f"🟢 💉 On Track Cycle Profile (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) is stable. Target Day {days_since_shot} profile:"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) is stable. Target profile:"
 
     msg = (
         f"{header}\n"
