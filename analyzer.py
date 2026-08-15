@@ -2,26 +2,93 @@ import os
 import requests
 from datetime import datetime, timedelta, timezone
 
-# Credentials & Setup
+# ============================================================================
+# CREDENTIALS & SETUP (use environment variables only)
+# ============================================================================
 EMAIL = os.environ.get("TIDEPOOL_EMAIL", "kmsloan4@gmail.com")
 PASSWORD = os.environ.get("TIDEPOOL_PASSWORD", "Number4444!!")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 
+# ============================================================================
+# MOUNJARO CYCLE CONFIGURATION
+# ============================================================================
 # Last Shot Date (Sunday July 26, 2026)
 LAST_SHOT_DATE = datetime(2026, 7, 26)
 
 # Mode Toggle: Set to False while paused/waiting for refill
-ON_MOUNJARO_SCHEDULE = False  
+ON_MOUNJARO_SCHEDULE = False
 
-# Baseline Settings Range
-FRESH_SHOT_ISF = 36.0   # Fresh shot sensitivity
-FRESH_SHOT_CR = 10.0
+# ============================================================================
+# ISF & CR BASELINE SETTINGS RANGE
+# ============================================================================
+FRESH_SHOT_ISF = 36.0   # Fresh shot sensitivity (mg/dL/U)
+FRESH_SHOT_CR = 10.0    # Fresh shot carb ratio (g/U)
 
-MAX_RESIST_ISF = 22.0   # Off-shot / Max resistance
-MAX_RESIST_CR = 6.0
+MAX_RESIST_ISF = 22.0   # Off-shot / Max resistance ISF
+MAX_RESIST_CR = 6.0     # Off-shot / Max resistance CR
 
-# Target Average Glucose Benchmark
+# ============================================================================
+# BASAL RATE SETTINGS (Nighttime vs Daytime)
+# ============================================================================
+# Nighttime: typically 10 PM to 7 AM (lower basal rates)
+# Daytime: typically 7 AM to 10 PM (higher basal rates from your pump screenshot)
+
+NIGHTTIME_START = 22  # 10 PM
+NIGHTTIME_END = 7     # 7 AM
+
+# Nighttime basal rates (capped lower - max 1.0 U/hr)
+NIGHTTIME_BASAL = {
+    "fresh": 0.9,       # Fresh shot basal at night
+    "resistant": 1.0    # Off-shot/resistant basal at night (max 1.0)
+}
+
+# Daytime basal rates (from your pump screenshot)
+DAYTIME_BASAL = {
+    "fresh": 0.9,       # Fresh shot basal during day
+    "resistant": 1.4    # Off-shot/resistant basal during day
+}
+
+# ============================================================================
+# TARGET & BENCHMARK SETTINGS
+# ============================================================================
 TARGET_MGDL = 117.5
+
+# Drift Sensitivity: How much to adjust for each 25 mg/dL of drift
+DRIFT_THRESHOLD = 25.0
+
+def get_current_basal_rate_profile() -> dict:
+    """
+    Get the current basal rate based on whether it's nighttime or daytime.
+    
+    Returns:
+        Dictionary with "fresh" and "resistant" basal rates
+    """
+    now = datetime.now()
+    current_hour = now.hour
+    
+    # Check if it's nighttime (10 PM to 7 AM)
+    if current_hour >= NIGHTTIME_START or current_hour < NIGHTTIME_END:
+        return NIGHTTIME_BASAL
+    else:
+        return DAYTIME_BASAL
+
+
+def calculate_basal_rate(fresh_rate: float, resistant_rate: float, resistance_adj: float) -> float:
+    """
+    Calculate recommended basal rate based on resistance adjustment.
+    
+    Args:
+        fresh_rate: Basal rate when fresh on Mounjaro (low resistance)
+        resistant_rate: Basal rate when off-shot or at peak resistance
+        resistance_adj: Resistance adjustment factor (0.0 to 1.0)
+    
+    Returns:
+        Recommended basal rate in U/hr
+    """
+    # Interpolate between fresh and resistant rates
+    rec_basal = fresh_rate + (resistant_rate - fresh_rate) * resistance_adj
+    return round(rec_basal, 2)
+
 
 def get_tidepool_data():
     """Logs into Tidepool API and fetches last 14 days of CGM data in mg/dL."""
@@ -89,17 +156,32 @@ def analyze():
 
     # 4. Apply 24h Glucose Modifier (+/- adjustment)
     drift = recent_avg - target_bg
-    drift_adj = drift / 25.0
+    drift_adj = drift / DRIFT_THRESHOLD
     
     final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
 
+    # 5. Calculate Recommended Settings
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
     rec_cr = round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj, 1)
+    
+    # 6. Calculate Both Nighttime and Daytime Basal Rates
+    rec_night_basal = calculate_basal_rate(
+        NIGHTTIME_BASAL["fresh"],
+        NIGHTTIME_BASAL["resistant"],
+        final_adj
+    )
+    rec_day_basal = calculate_basal_rate(
+        DAYTIME_BASAL["fresh"],
+        DAYTIME_BASAL["resistant"],
+        final_adj
+    )
 
     print(f"🗓️ Day {days_since_shot} Since Last Mounjaro Shot (Off-Shot Mode)")
     print(f"24h Avg: {recent_avg:.1f} mg/dL | Drift: {drift:+.1f} mg/dL | Resistance Adj: {final_adj:.2f}")
+    print(f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal} U/hr")
+    print(f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal} U/hr")
 
-    # 5. Build Message
+    # 7. Build Message
     if not ON_MOUNJARO_SCHEDULE:
         header = f"⚠️ 💉 Mounjaro Off-Shot Pause (Day {days_since_shot})"
         if drift > 10.0:
@@ -114,10 +196,12 @@ def analyze():
         f"{header}\n"
         f"{action}\n"
         f"🎯 Set ISF: {rec_isf} mg/dL/U\n"
-        f"🍕 Set CR: {rec_cr} g/U"
+        f"🍕 Set CR: {rec_cr} g/U\n"
+        f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal} U/hr\n"
+        f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal} U/hr"
     )
 
-    # 6. Send Push Notification
+    # 8. Send Push Notification
     try:
         res = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
