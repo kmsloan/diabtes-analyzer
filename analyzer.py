@@ -12,11 +12,11 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 # ============================================================================
 # MOUNJARO CYCLE CONFIGURATION
 # ============================================================================
-# Last Shot Date (Sunday July 26, 2026)
-LAST_SHOT_DATE = datetime(2026, 7, 26)
+# Last Shot Date (Sunday August 23, 2026)
+LAST_SHOT_DATE = datetime(2026, 8, 23)
 
-# Mode Toggle: Set to False while paused/waiting for refill
-ON_MOUNJARO_SCHEDULE = False
+# Mode Toggle: Set to True for active 14-day cycle, False when paused
+ON_MOUNJARO_SCHEDULE = True
 
 # ============================================================================
 # ISF & CR BASELINE SETTINGS RANGE
@@ -30,9 +30,6 @@ MAX_RESIST_CR = 6.0     # Off-shot / Max resistance CR
 # ============================================================================
 # BASAL RATE SETTINGS (Nighttime vs Daytime)
 # ============================================================================
-# Nighttime: typically 10 PM to 7 AM (lower basal rates)
-# Daytime: typically 7 AM to 10 PM (higher basal rates from your pump screenshot)
-
 NIGHTTIME_START = 22  # 10 PM
 NIGHTTIME_END = 7     # 7 AM
 
@@ -42,7 +39,7 @@ NIGHTTIME_BASAL = {
     "resistant": 1.0    # Off-shot/resistant basal at night (max 1.0)
 }
 
-# Daytime basal rates (from your pump screenshot)
+# Daytime basal rates
 DAYTIME_BASAL = {
     "fresh": 0.9,       # Fresh shot basal during day
     "resistant": 1.4    # Off-shot/resistant basal during day
@@ -52,40 +49,11 @@ DAYTIME_BASAL = {
 # TARGET & BENCHMARK SETTINGS
 # ============================================================================
 TARGET_MGDL = 117.5
-
-# Drift Sensitivity: How much to adjust for each 25 mg/dL of drift
 DRIFT_THRESHOLD = 25.0
-
-def get_current_basal_rate_profile() -> dict:
-    """
-    Get the current basal rate based on whether it's nighttime or daytime.
-    
-    Returns:
-        Dictionary with "fresh" and "resistant" basal rates
-    """
-    now = datetime.now()
-    current_hour = now.hour
-    
-    # Check if it's nighttime (10 PM to 7 AM)
-    if current_hour >= NIGHTTIME_START or current_hour < NIGHTTIME_END:
-        return NIGHTTIME_BASAL
-    else:
-        return DAYTIME_BASAL
 
 
 def calculate_basal_rate(fresh_rate: float, resistant_rate: float, resistance_adj: float) -> float:
-    """
-    Calculate recommended basal rate based on resistance adjustment.
-    
-    Args:
-        fresh_rate: Basal rate when fresh on Mounjaro (low resistance)
-        resistant_rate: Basal rate when off-shot or at peak resistance
-        resistance_adj: Resistance adjustment factor (0.0 to 1.0)
-    
-    Returns:
-        Recommended basal rate in U/hr
-    """
-    # Interpolate between fresh and resistant rates
+    """Calculate recommended basal rate based on resistance adjustment."""
     rec_basal = fresh_rate + (resistant_rate - fresh_rate) * resistance_adj
     return round(rec_basal, 2)
 
@@ -95,7 +63,7 @@ def get_tidepool_data():
     print("🔐 Logging into Tidepool API...")
     login_url = "https://api.tidepool.org/auth/login"
     
-    res = requests.post(login_url, auth=(EMAIL, PASSWORD))
+    res = requests.post(login_url, auth=(EMAIL, PASSWORD), timeout=10)
     if res.status_code != 200:
         raise Exception(f"Tidepool Login Failed ({res.status_code}): {res.text}")
     
@@ -108,7 +76,7 @@ def get_tidepool_data():
     data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={fourteen_days_ago}"
     
     print("📥 Pulling last 14 days of Libre 3 data...")
-    cbg_res = requests.get(data_url, headers=headers)
+    cbg_res = requests.get(data_url, headers=headers, timeout=15)
     cbg_data = cbg_res.json() if cbg_res.status_code == 200 else []
     print(f"✅ Pulled {len(cbg_data)} recent CGM readings!")
 
@@ -134,6 +102,7 @@ def get_tidepool_data():
 
     return TARGET_MGDL, recent_avg
 
+
 def analyze():
     # 1. Fetch Data
     target_bg, recent_avg = get_tidepool_data()
@@ -144,53 +113,55 @@ def analyze():
 
     # 3. Calculate Baseline Resistance
     if ON_MOUNJARO_SCHEDULE:
-        # Standard 14-day cycle ramp
         cycle_day = days_since_shot % 14
         if cycle_day <= 3:
             cycle_base_adj = 0.0
         else:
             cycle_base_adj = min((cycle_day - 3) / 9.0, 1.0)
     else:
-        # OFF-SHOT MODE: Lock baseline to max resistance (1.0)
+        cycle_day = days_since_shot
         cycle_base_adj = 1.0
 
     # 4. Apply 24h Glucose Modifier (+/- adjustment)
     drift = recent_avg - target_bg
     drift_adj = drift / DRIFT_THRESHOLD
     
-    final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
+    # On Fresh Shot Day (Day 0), reset resistance factor completely
+    if ON_MOUNJARO_SCHEDULE and cycle_day == 0:
+        final_adj = 0.0
+    else:
+        final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
 
     # 5. Calculate Recommended Settings
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
     rec_cr = round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj, 1)
     
-    # 6. Calculate Both Nighttime and Daytime Basal Rates
-    rec_night_basal = calculate_basal_rate(
-        NIGHTTIME_BASAL["fresh"],
-        NIGHTTIME_BASAL["resistant"],
-        final_adj
-    )
-    rec_day_basal = calculate_basal_rate(
-        DAYTIME_BASAL["fresh"],
-        DAYTIME_BASAL["resistant"],
-        final_adj
-    )
+    # 6. Calculate Basal Rates
+    rec_night_basal = calculate_basal_rate(NIGHTTIME_BASAL["fresh"], NIGHTTIME_BASAL["resistant"], final_adj)
+    rec_day_basal = calculate_basal_rate(DAYTIME_BASAL["fresh"], DAYTIME_BASAL["resistant"], final_adj)
 
-    print(f"🗓️ Day {days_since_shot} Since Last Mounjaro Shot (Off-Shot Mode)")
+    status_mode = f"Day {cycle_day} of 14 (Active 14-Day Cycle)" if ON_MOUNJARO_SCHEDULE else f"Day {days_since_shot} (Off-Shot Mode)"
+    print(f"🗓️ {status_mode}")
     print(f"24h Avg: {recent_avg:.1f} mg/dL | Drift: {drift:+.1f} mg/dL | Resistance Adj: {final_adj:.2f}")
     print(f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal} U/hr")
     print(f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal} U/hr")
 
     # 7. Build Message
-    if not ON_MOUNJARO_SCHEDULE:
-        header = f"⚠️ 💉 Mounjaro Off-Shot Pause (Day {days_since_shot})"
-        if drift > 10.0:
-            action = f"24h Avg ({recent_avg:.1f} mg/dL) elevated without Mounjaro. Max resistance active:"
-        else:
-            action = f"24h Avg ({recent_avg:.1f} mg/dL) holding. Recommended off-shot profile:"
+    if ON_MOUNJARO_SCHEDULE and cycle_day == 0:
+        header = "💉 🟢 Mounjaro Shot Day Reset (Day 0/14)"
+        action = "Fresh shot active tonight! Set Twiist pump to peak sensitivity profile:"
+    elif not ON_MOUNJARO_SCHEDULE:
+        header = f"⚠️ 💉 Mounjaro Off-Shot Mode (Day {days_since_shot})"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL). Holding off-shot resistance profile:"
+    elif drift > 10.0:
+        header = f"⚠️ 💉 Waning Resistance Drift Alert (Day {cycle_day}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) elevated. Tightening settings beyond baseline:"
+    elif drift < -10.0:
+        header = f"🟢 💉 Glucose Relaxation Alert (Day {cycle_day}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) low. Relaxing settings below baseline:"
     else:
-        header = f"🟢 💉 On Track Cycle Profile (Day {days_since_shot}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) is stable. Target profile:"
+        header = f"🟢 💉 On Track Cycle Profile (Day {cycle_day}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) stable. Target Day {cycle_day} profile:"
 
     msg = (
         f"{header}\n"
@@ -206,7 +177,8 @@ def analyze():
         res = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=msg.encode('utf-8'),
-            headers={"Title": "Twiist Pump Profile Status"}
+            headers={"Title": "Twiist Pump Profile Status"},
+            timeout=10
         )
         if res.status_code == 200:
             print("📲 Push notification sent to phone!")
@@ -215,6 +187,7 @@ def analyze():
             print(f"❌ Failed to send phone alert: {res.status_code}")
     except Exception as e:
         print(f"❌ Error sending notification: {e}")
+
 
 if __name__ == "__main__":
     analyze()
