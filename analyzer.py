@@ -19,13 +19,13 @@ LAST_SHOT_DATE = datetime(2026, 8, 23)
 ON_MOUNJARO_SCHEDULE = True
 
 # ============================================================================
-# ISF & CR BASELINE SETTINGS RANGE
+# ISF & CR BASELINE SETTINGS
 # ============================================================================
-FRESH_SHOT_ISF = 36.0   # Fresh shot sensitivity (mg/dL/U)
-FRESH_SHOT_CR = 10.0    # Fresh shot carb ratio (g/U)
+FRESH_SHOT_ISF = 36.0   # Days 0-3 Peak sensitivity (mg/dL/U)
+FRESH_SHOT_CR = 10.0    # Days 0-3 Peak carb ratio (g/U)
 
-MAX_RESIST_ISF = 22.0   # Off-shot / Max resistance ISF
-MAX_RESIST_CR = 6.0     # Off-shot / Max resistance CR
+MAX_RESIST_ISF = 22.0   # Day 12-14 / Off-shot max resistance ISF
+MAX_RESIST_CR = 6.0     # Day 12-14 / Off-shot max resistance CR
 
 # ============================================================================
 # BASAL RATE SETTINGS (Nighttime vs Daytime)
@@ -33,23 +33,21 @@ MAX_RESIST_CR = 6.0     # Off-shot / Max resistance CR
 NIGHTTIME_START = 22  # 10 PM
 NIGHTTIME_END = 7     # 7 AM
 
-# Nighttime basal rates (capped lower - max 1.0 U/hr)
 NIGHTTIME_BASAL = {
-    "fresh": 0.9,       # Fresh shot basal at night
-    "resistant": 1.0    # Off-shot/resistant basal at night (max 1.0)
+    "fresh": 0.85,      # Fresh shot basal at night
+    "resistant": 1.00   # Max resistance basal at night
 }
 
-# Daytime basal rates
 DAYTIME_BASAL = {
-    "fresh": 0.9,       # Fresh shot basal during day
-    "resistant": 1.4    # Off-shot/resistant basal during day
+    "fresh": 0.90,      # Fresh shot basal during day
+    "resistant": 1.40   # Max resistance basal during day
 }
 
 # ============================================================================
 # TARGET & BENCHMARK SETTINGS
 # ============================================================================
 TARGET_MGDL = 117.5
-DRIFT_THRESHOLD = 25.0
+DRIFT_THRESHOLD = 50.0  # Smoothed: prevents single spikes from dominating
 
 
 def calculate_basal_rate(fresh_rate: float, resistant_rate: float, resistance_adj: float) -> float:
@@ -111,32 +109,39 @@ def analyze():
     today = datetime.now()
     days_since_shot = (today - LAST_SHOT_DATE).days
 
-    # 3. Calculate Baseline Resistance
+    # 3. Calculate Resistance Adjustment with Smoothing
     if ON_MOUNJARO_SCHEDULE:
         cycle_day = days_since_shot % 14
+        
+        # Days 0-3: Peak Sensitivity (Lock to Fresh Baseline)
         if cycle_day <= 3:
-            cycle_base_adj = 0.0
+            final_adj = 0.0
+        elif cycle_day <= 7:
+            # Days 4-7: Early Waning (Dampened drift influence)
+            cycle_base_adj = (cycle_day - 3) / 9.0
+            drift = recent_avg - target_bg
+            drift_adj = (drift / DRIFT_THRESHOLD) * 0.5
+            final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
         else:
+            # Days 8-13: Late Waning (Full drift response)
             cycle_base_adj = min((cycle_day - 3) / 9.0, 1.0)
+            drift = recent_avg - target_bg
+            drift_adj = drift / DRIFT_THRESHOLD
+            final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
     else:
+        # Off-Shot Mode
         cycle_day = days_since_shot
-        cycle_base_adj = 1.0
+        drift = recent_avg - target_bg
+        drift_adj = drift / DRIFT_THRESHOLD
+        final_adj = min(max(1.0 + drift_adj, 0.0), 1.0)
 
-    # 4. Apply 24h Glucose Modifier (+/- adjustment)
     drift = recent_avg - target_bg
-    drift_adj = drift / DRIFT_THRESHOLD
-    
-    # On Fresh Shot Day (Day 0), reset resistance factor completely
-    if ON_MOUNJARO_SCHEDULE and cycle_day == 0:
-        final_adj = 0.0
-    else:
-        final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
 
-    # 5. Calculate Recommended Settings
+    # 4. Calculate Recommended Settings
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
     rec_cr = round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj, 1)
     
-    # 6. Calculate Basal Rates
+    # 5. Calculate Basal Rates
     rec_night_basal = calculate_basal_rate(NIGHTTIME_BASAL["fresh"], NIGHTTIME_BASAL["resistant"], final_adj)
     rec_day_basal = calculate_basal_rate(DAYTIME_BASAL["fresh"], DAYTIME_BASAL["resistant"], final_adj)
 
@@ -146,16 +151,16 @@ def analyze():
     print(f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal} U/hr")
     print(f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal} U/hr")
 
-    # 7. Build Message
-    if ON_MOUNJARO_SCHEDULE and cycle_day == 0:
-        header = "💉 🟢 Mounjaro Shot Day Reset (Day 0/14)"
-        action = "Fresh shot active tonight! Set Twiist pump to peak sensitivity profile:"
+    # 6. Build Message
+    if ON_MOUNJARO_SCHEDULE and cycle_day <= 3:
+        header = f"💉 🟢 Peak Sensitivity Window (Day {cycle_day}/14)"
+        action = "Peak Mounjaro active. Post-bolus only to match gastric delay:"
     elif not ON_MOUNJARO_SCHEDULE:
         header = f"⚠️ 💉 Mounjaro Off-Shot Mode (Day {days_since_shot})"
         action = f"24h Avg ({recent_avg:.1f} mg/dL). Holding off-shot resistance profile:"
-    elif drift > 10.0:
-        header = f"⚠️ 💉 Waning Resistance Drift Alert (Day {cycle_day}/14)"
-        action = f"24h Avg ({recent_avg:.1f} mg/dL) elevated. Tightening settings beyond baseline:"
+    elif drift > 15.0:
+        header = f"⚠️ 💉 Gradual Waning Drift Alert (Day {cycle_day}/14)"
+        action = f"24h Avg ({recent_avg:.1f} mg/dL) elevated. Stepping settings smoothly:"
     elif drift < -10.0:
         header = f"🟢 💉 Glucose Relaxation Alert (Day {cycle_day}/14)"
         action = f"24h Avg ({recent_avg:.1f} mg/dL) low. Relaxing settings below baseline:"
@@ -172,7 +177,7 @@ def analyze():
         f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal} U/hr"
     )
 
-    # 8. Send Push Notification
+    # 7. Send Push Notification
     try:
         res = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
