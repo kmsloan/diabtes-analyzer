@@ -13,7 +13,7 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 # MOUNJARO CYCLE CONFIGURATION
 # ============================================================================
 # Last Shot Date (Tueday September 8, 2026)
-LAST_SHOT_DATE = datetime(2026, 9, 8)
+LAST_SHOT_DATE = datetime(2026, 9, 13)
 
 # Mode Toggle: Set to True for active 14-day cycle, False when paused
 ON_MOUNJARO_SCHEDULE = True
