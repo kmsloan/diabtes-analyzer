@@ -15,13 +15,13 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 LAST_SHOT_DATE = datetime(2026, 9, 8)
 
 ON_MOUNJARO_SCHEDULE = True
-CYCLE_DAYS = 7  # 🟢 SET TO 7 FOR WEEKLY SHOTS, OR 14 FOR BI-WEEKLY
+CYCLE_DAYS = 7  # 7 FOR WEEKLY SHOTS, OR 14 FOR BI-WEEKLY
 
 # ============================================================================
 # ISF & CR BASELINE SETTINGS
 # ============================================================================
 FRESH_SHOT_ISF = 36.0   
-FRESH_SHOT_CR = 10.0    # Will now only output as whole numbers (e.g., 10, 9, 8...)
+FRESH_SHOT_CR = 10.0    # Whole numbers only
 
 MAX_RESIST_ISF = 22.0   
 MAX_RESIST_CR = 6.0     
@@ -43,7 +43,8 @@ DRIFT_THRESHOLD = 50.0
 
 def calculate_basal_rate(fresh_rate: float, resistant_rate: float, resistance_adj: float) -> float:
     rec_basal = fresh_rate + (resistant_rate - fresh_rate) * resistance_adj
-    return round(rec_basal, 2)
+    # 🟢 Round to the nearest 0.05
+    return round(round(rec_basal * 20) / 20.0, 2)
 
 def get_tidepool_data():
     print("🔐 Logging into Tidepool API...")
@@ -89,7 +90,6 @@ def analyze():
     if ON_MOUNJARO_SCHEDULE:
         cycle_day = days_since_shot % CYCLE_DAYS
         
-        # Dynamic math based on weekly (7) vs bi-weekly (14) schedule
         if CYCLE_DAYS == 7:
             if cycle_day <= 2:
                 final_adj = 0.0
@@ -116,7 +116,6 @@ def analyze():
 
     drift = recent_avg - target_bg
 
-    # 🟢 Whole Number CR Fix & ISF Calculation
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
     rec_cr = int(round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj))
     
@@ -136,12 +135,13 @@ def analyze():
     else:
         header = f"🟢 💉 On Track Cycle Profile (Day {cycle_day}/{CYCLE_DAYS})"
 
+    # 🟢 Format basal rates to always show two decimal places (e.g., 0.90)
     msg = (
         f"{header}\n"
         f"🎯 Set ISF: {rec_isf} mg/dL/U\n"
         f"🍕 Set CR: {rec_cr} g/U\n"
-        f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal} U/hr\n"
-        f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal} U/hr"
+        f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal:.2f} U/hr\n"
+        f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal:.2f} U/hr"
     )
 
     try:
