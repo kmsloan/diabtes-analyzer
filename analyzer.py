@@ -12,13 +12,12 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 # ============================================================================
 # MOUNJARO CYCLE CONFIGURATION
 # ============================================================================
-LAST_SHOT_DATE = datetime(2026, 9, 8)
-
+LAST_SHOT_DATE = datetime(2026, 9, 20)  # Update to your most recent shot date
 ON_MOUNJARO_SCHEDULE = True
-CYCLE_DAYS = 7  # 7 FOR WEEKLY SHOTS, OR 14 FOR BI-WEEKLY
+CYCLE_DAYS = 7  # 7 for weekly, 14 for bi-weekly
 
 # ============================================================================
-# ISF & CR BASELINE SETTINGS
+# PUMP SETTING BOUNDARIES
 # ============================================================================
 FRESH_SHOT_ISF = 36.0   
 FRESH_SHOT_CR = 10.0    # Whole numbers only
@@ -26,24 +25,18 @@ FRESH_SHOT_CR = 10.0    # Whole numbers only
 MAX_RESIST_ISF = 22.0   
 MAX_RESIST_CR = 6.0     
 
-# ============================================================================
-# BASAL RATE SETTINGS (Nighttime vs Daytime)
-# ============================================================================
-NIGHTTIME_START = 22  
-NIGHTTIME_END = 7     
-
+# Basal settings (0.05 step increments)
 NIGHTTIME_BASAL = {"fresh": 0.85, "resistant": 1.00}
 DAYTIME_BASAL = {"fresh": 0.90, "resistant": 1.40}
 
 # ============================================================================
-# TARGET & BENCHMARK SETTINGS
+# CLINICAL TARGETS (24-Hour Performance Evaluation)
 # ============================================================================
-TARGET_MGDL = 117.5
-DRIFT_THRESHOLD = 50.0  
+TARGET_MGDL = 115.0
+DRIFT_CEILING = 145.0   # Only tighten if 24h average exceeds this threshold
 
 def calculate_basal_rate(fresh_rate: float, resistant_rate: float, resistance_adj: float) -> float:
     rec_basal = fresh_rate + (resistant_rate - fresh_rate) * resistance_adj
-    # 🟢 Round to the nearest 0.05
     return round(round(rec_basal * 20) / 20.0, 2)
 
 def get_tidepool_data():
@@ -58,9 +51,10 @@ def get_tidepool_data():
     user_id = res.json().get("userid")
     print("✅ Successfully authenticated!")
 
-    fourteen_days_ago = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # Pull last 4 days to ensure full 24-hour window coverage
+    four_days_ago = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     headers = {"x-tidepool-session-token": session_token}
-    data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={fourteen_days_ago}"
+    data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={four_days_ago}"
     
     print("📥 Pulling recent CGM readings...")
     cbg_res = requests.get(data_url, headers=headers, timeout=15)
@@ -69,7 +63,8 @@ def get_tidepool_data():
     valid_entries = []
     for entry in cbg_data:
         if "value" in entry and "time" in entry:
-            val_mgdl = entry["value"] * 18.0182
+            # Tidepool values in mmol/L -> convert to mg/dL
+            val_mgdl = entry["value"] * 18.0182 if entry["value"] < 30 else entry["value"]
             time_str = entry["time"].replace("Z", "+00:00")
             dt = datetime.fromisoformat(time_str)
             valid_entries.append({"time": dt, "value": val_mgdl})
@@ -77,71 +72,61 @@ def get_tidepool_data():
     now_utc = datetime.now(timezone.utc)
     twenty_four_hours_ago = now_utc - timedelta(hours=24)
 
-    recent_readings = [e["value"] for e in valid_entries if e["time"] >= twenty_four_hours_ago]
-    recent_avg = sum(recent_readings) / len(recent_readings) if recent_readings else TARGET_MGDL
+    readings_24h = [e["value"] for e in valid_entries if e["time"] >= twenty_four_hours_ago]
+    
+    if not readings_24h:
+        return TARGET_MGDL, 0.0
 
-    return TARGET_MGDL, recent_avg
+    avg_24h = sum(readings_24h) / len(readings_24h)
+    low_pct_24h = (sum(1 for v in readings_24h if v < 70.0) / len(readings_24h)) * 100.0
+
+    return avg_24h, low_pct_24h
 
 def analyze():
-    target_bg, recent_avg = get_tidepool_data()
+    avg_24h, low_pct_24h = get_tidepool_data()
     today = datetime.now()
     days_since_shot = (today - LAST_SHOT_DATE).days
+    cycle_day = days_since_shot % CYCLE_DAYS if ON_MOUNJARO_SCHEDULE else days_since_shot
 
-    if ON_MOUNJARO_SCHEDULE:
-        cycle_day = days_since_shot % CYCLE_DAYS
-        
-        if CYCLE_DAYS == 7:
-            if cycle_day <= 2:
-                final_adj = 0.0
-            else:
-                cycle_base_adj = (cycle_day - 2) / 4.0
-                drift_adj = (recent_avg - target_bg) / DRIFT_THRESHOLD
-                final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
+    print(f"📊 24-Hour Performance: Avg = {avg_24h:.1f} mg/dL | Lows (<70) = {low_pct_24h:.1f}%")
+
+    # ========================================================================
+    # PERFORMANCE-DRIVEN LOGIC (NO CALENDAR-FORCED RAMP)
+    # ========================================================================
+    if low_pct_24h >= 3.0 or avg_24h < 105.0:
+        # 🔴 Safety First: Recent lows or running low -> Full baseline relaxation
+        final_adj = 0.0
+        status_note = f"🟢 Lows detected ({low_pct_24h:.1f}% time < 70). Preserving baseline to prevent crashes."
+    elif avg_24h <= DRIFT_CEILING:
+        # 🟢 Sweet Spot: Average is between 105 and 145 mg/dL -> Keep baseline/moderate
+        # Proportional gentle nudge only if between 125 and 145
+        if avg_24h > 125.0:
+            final_adj = (avg_24h - 125.0) / (DRIFT_CEILING - 125.0) * 0.35  # max 35% mild adjustment
+            status_note = f"🟢 Controlled range (Avg {avg_24h:.1f} mg/dL). Mild sensitivity fine-tuning."
         else:
-            if cycle_day <= 3:
-                final_adj = 0.0
-            elif cycle_day <= 7:
-                cycle_base_adj = (cycle_day - 3) / 9.0
-                drift_adj = ((recent_avg - target_bg) / DRIFT_THRESHOLD) * 0.5
-                final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
-            else:
-                cycle_base_adj = min((cycle_day - 3) / 9.0, 1.0)
-                drift_adj = (recent_avg - target_bg) / DRIFT_THRESHOLD
-                final_adj = min(max(cycle_base_adj + drift_adj, 0.0), 1.0)
+            final_adj = 0.0
+            status_note = f"🟢 Excellent control (Avg {avg_24h:.1f} mg/dL). Settings are working well."
     else:
-        cycle_day = days_since_shot
-        drift = recent_avg - target_bg
-        drift_adj = drift / DRIFT_THRESHOLD
-        final_adj = min(max(1.0 + drift_adj, 0.0), 1.0)
+        # ⚠️ Genuine Resistance: 24h avg > 145 mg/dL without lows -> Scale resistance
+        excess_drift = min(avg_24h - DRIFT_CEILING, 40.0)
+        final_adj = min(0.35 + (excess_drift / 40.0) * 0.65, 1.0)
+        status_note = f"⚠️ Persistent high drift (Avg {avg_24h:.1f} mg/dL). Adjusting for resistance."
 
-    drift = recent_avg - target_bg
-
+    # Calculate final pump values
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * final_adj))
     rec_cr = int(round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * final_adj))
-    
     rec_night_basal = calculate_basal_rate(NIGHTTIME_BASAL["fresh"], NIGHTTIME_BASAL["resistant"], final_adj)
     rec_day_basal = calculate_basal_rate(DAYTIME_BASAL["fresh"], DAYTIME_BASAL["resistant"], final_adj)
 
-    status_mode = f"Day {cycle_day} of {CYCLE_DAYS} ({CYCLE_DAYS}-Day Cycle)" if ON_MOUNJARO_SCHEDULE else f"Day {days_since_shot} (Off-Shot Mode)"
-    
-    if ON_MOUNJARO_SCHEDULE and cycle_day <= (2 if CYCLE_DAYS == 7 else 3):
-        header = f"💉 🟢 Peak Sensitivity Window (Day {cycle_day}/{CYCLE_DAYS})"
-    elif not ON_MOUNJARO_SCHEDULE:
-        header = f"⚠️ 💉 Mounjaro Off-Shot Mode (Day {days_since_shot})"
-    elif drift > 15.0:
-        header = f"⚠️ 💉 Gradual Waning Drift Alert (Day {cycle_day}/{CYCLE_DAYS})"
-    elif drift < -10.0:
-        header = f"🟢 💉 Glucose Relaxation Alert (Day {cycle_day}/{CYCLE_DAYS})"
-    else:
-        header = f"🟢 💉 On Track Cycle Profile (Day {cycle_day}/{CYCLE_DAYS})"
+    header = f"💉 Day {cycle_day}/{CYCLE_DAYS} Profile Review"
 
-    # 🟢 Format basal rates to always show two decimal places (e.g., 0.90)
     msg = (
         f"{header}\n"
+        f"{status_note}\n"
         f"🎯 Set ISF: {rec_isf} mg/dL/U\n"
         f"🍕 Set CR: {rec_cr} g/U\n"
-        f"🌙 Night (10 PM - 7 AM) Basal: {rec_night_basal:.2f} U/hr\n"
-        f"☀️ Day (7 AM - 10 PM) Basal: {rec_day_basal:.2f} U/hr"
+        f"🌙 Night Basal: {rec_night_basal:.2f} U/hr\n"
+        f"☀️ Day Basal: {rec_day_basal:.2f} U/hr"
     )
 
     try:
