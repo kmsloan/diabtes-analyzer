@@ -17,13 +17,13 @@ ON_MOUNJARO_SCHEDULE = True
 CYCLE_DAYS = 7  # 7 for weekly, 14 for bi-weekly
 
 # ============================================================================
-# PUMP SETTING BOUNDARIES
+# PUMP SETTING BOUNDARIES (Adjusted for Post-Meal Crash Safety)
 # ============================================================================
-FRESH_SHOT_ISF = 36.0   
-FRESH_SHOT_CR = 10.0    # Whole numbers only
+FRESH_SHOT_ISF = 45.0   # Weaker sensitivity to stop crashes
+FRESH_SHOT_CR = 14.0    # Weaker meal ratio to stop post-meal lows
 
-MAX_RESIST_ISF = 22.0   
-MAX_RESIST_CR = 6.0     
+MAX_RESIST_ISF = 26.0   # Safer max resistance floor
+MAX_RESIST_CR = 8.0     
 
 # Basal settings (0.05 step increments)
 NIGHTTIME_BASAL = {"fresh": 0.85, "resistant": 1.00}
@@ -51,10 +51,10 @@ def get_tidepool_data():
     user_id = res.json().get("userid")
     print("✅ Successfully authenticated!")
 
-    # Pull last 4 days to ensure full 24-hour window coverage
-    four_days_ago = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # Pull last 2 days to ensure we have a full 24-hour buffer
+    two_days_ago = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     headers = {"x-tidepool-session-token": session_token}
-    data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={four_days_ago}"
+    data_url = f"https://api.tidepool.org/data/{user_id}?type=cbg&startDate={two_days_ago}"
     
     print("📥 Pulling recent CGM readings...")
     cbg_res = requests.get(data_url, headers=headers, timeout=15)
@@ -72,36 +72,49 @@ def get_tidepool_data():
     now_utc = datetime.now(timezone.utc)
     twenty_four_hours_ago = now_utc - timedelta(hours=24)
 
-    readings_24h = [e["value"] for e in valid_entries if e["time"] >= twenty_four_hours_ago]
+    readings_24h = []
+    daytime_readings_24h = []
+
+    for e in valid_entries:
+        if e["time"] >= twenty_four_hours_ago:
+            readings_24h.append(e["value"])
+            # Filter for daytime only (7 AM to 10 PM) using EDT local hour approximation
+            local_hour = (e["time"] - timedelta(hours=4)).hour 
+            if 7 <= local_hour < 22:
+                daytime_readings_24h.append(e["value"])
     
     if not readings_24h:
         return TARGET_MGDL, 0.0
 
     avg_24h = sum(readings_24h) / len(readings_24h)
-    low_pct_24h = (sum(1 for v in readings_24h if v < 70.0) / len(readings_24h)) * 100.0
+    
+    # Calculate lows ONLY based on daytime readings to ignore compression lows
+    if daytime_readings_24h:
+        daytime_low_pct = (sum(1 for v in daytime_readings_24h if v < 70.0) / len(daytime_readings_24h)) * 100.0
+    else:
+        daytime_low_pct = 0.0
 
-    return avg_24h, low_pct_24h
+    return avg_24h, daytime_low_pct
 
 def analyze():
-    avg_24h, low_pct_24h = get_tidepool_data()
+    avg_24h, daytime_low_pct = get_tidepool_data()
     today = datetime.now()
     days_since_shot = (today - LAST_SHOT_DATE).days
     cycle_day = days_since_shot % CYCLE_DAYS if ON_MOUNJARO_SCHEDULE else days_since_shot
 
-    print(f"📊 24-Hour Performance: Avg = {avg_24h:.1f} mg/dL | Lows (<70) = {low_pct_24h:.1f}%")
+    print(f"📊 24-Hour Performance: Avg = {avg_24h:.1f} mg/dL | Daytime Lows (<70) = {daytime_low_pct:.1f}%")
 
     # ========================================================================
-    # PERFORMANCE-DRIVEN LOGIC (NO CALENDAR-FORCED RAMP)
+    # PERFORMANCE-DRIVEN LOGIC
     # ========================================================================
-    if low_pct_24h >= 3.0 or avg_24h < 105.0:
-        # 🔴 Safety First: Recent lows or running low -> Full baseline relaxation
+    if daytime_low_pct >= 3.0 or avg_24h < 105.0:
+        # 🔴 Safety First: Daytime lows detected -> Full baseline relaxation
         final_adj = 0.0
-        status_note = f"🟢 Lows detected ({low_pct_24h:.1f}% time < 70). Preserving baseline to prevent crashes."
+        status_note = f"🟢 Daytime Lows detected ({daytime_low_pct:.1f}% time < 70). Relaxing baseline to stop crashes."
     elif avg_24h <= DRIFT_CEILING:
         # 🟢 Sweet Spot: Average is between 105 and 145 mg/dL -> Keep baseline/moderate
-        # Proportional gentle nudge only if between 125 and 145
         if avg_24h > 125.0:
-            final_adj = (avg_24h - 125.0) / (DRIFT_CEILING - 125.0) * 0.35  # max 35% mild adjustment
+            final_adj = (avg_24h - 125.0) / (DRIFT_CEILING - 125.0) * 0.35
             status_note = f"🟢 Controlled range (Avg {avg_24h:.1f} mg/dL). Mild sensitivity fine-tuning."
         else:
             final_adj = 0.0
@@ -138,6 +151,7 @@ def analyze():
         )
         if res.status_code == 200:
             print("📲 Push notification sent to phone!")
+            print(f"\n--- Notification Preview ---\n{msg}\n----------------------------")
         else:
             print(f"❌ Failed to send phone alert: {res.status_code}")
     except Exception as e:
