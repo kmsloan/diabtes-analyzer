@@ -12,7 +12,7 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "kaitlin-twiist-alerts")
 # ============================================================================
 # MOUNJARO CYCLE CONFIGURATION
 # ============================================================================
-LAST_SHOT_DATE = datetime(2026, 9, 20)  # Update to your actual shot date
+LAST_SHOT_DATE = datetime(2026, 10, 21)  # Update to your actual shot date
 ON_MOUNJARO_SCHEDULE = True
 CYCLE_DAYS = 7  # 7 for weekly, 14 for bi-weekly
 
@@ -101,17 +101,19 @@ def analyze():
         gear_base = 1.0
 
     # Safety override and resistance fine-tuning
+    # Overrides based on actual 24-hour performance
     if daytime_low_pct >= 4.0:
-        gear_shift = max(gear_base - 0.5, 0.0)
-        status_note = f"🟢 Daytime Lows ({daytime_low_pct:.1f}%). Softening upfront insulin to protect against crashes."
+        # Full safety reset: lock gear to 0.0 (Fresh Shot / Slow Digestion)
+        gear_shift = 0.0
+        status_note = f"🟢 Daytime Lows detected ({daytime_low_pct:.1f}%). Resetting to safe baseline to prevent crashes."
     elif avg_24h <= DRIFT_CEILING:
         gear_shift = gear_base
-        status_note = f"🟢 Controlled range (Avg {avg_24h:.1f} mg/dL). Holding scheduled gear."
+        status_note = f"🟢 Controlled range (Avg {avg_24h:.1f} mg/dL). Holding scheduled profile."
     else:
         excess = min(avg_24h - DRIFT_CEILING, 40.0)
         gear_shift = min(gear_base + (excess / 40.0) * 0.5, 1.0)
         status_note = f"⚠️ High glucose drift (Avg {avg_24h:.1f} mg/dL). Tightening profile."
-
+        
     # Compute final whole-number CR and 0.05-increment basals
     rec_isf = int(round(FRESH_SHOT_ISF - (FRESH_SHOT_ISF - MAX_RESIST_ISF) * gear_shift))
     rec_cr = int(round(FRESH_SHOT_CR - (FRESH_SHOT_CR - MAX_RESIST_CR) * gear_shift))
